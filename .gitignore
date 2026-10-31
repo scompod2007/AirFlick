@@ -79,8 +79,6 @@ $RECYCLE.BIN/
 *.tmp
 *.temp
 scratch/
-
-
 clean_legacy.ps1
 clean_legacy.bat
 verify_and_prepare_git.bat
@@ -102,5 +100,3 @@ Services/GestureProcessLauncher.cs
 Services/IGestureBridgeTarget.cs
 docs/GESTURE_RECOGNITION.md
 docs/architecture-audit/03_GESTURE_SYSTEM.md
-
-
