@@ -1,0 +1,41 @@
+namespace AirFlick.Protocol;
+
+public static class ProtocolConstants
+{
+    public const int Magic = 0x57444342; // WDCB
+    public const int Version = 2;
+    public const int HeaderSize = 56;
+    public const int MaxMetadataBytes = 64 * 1024;
+    public const int MaxPayloadBytes = 1024 * 1024;
+
+    public const string AppId = "wdcable";
+
+    public const int DefaultRendezvousPort = 8987;
+    public const int DefaultControlPort = 8988;
+    public const int DefaultBulkPort = 8989;
+
+    public const string CapabilityChat = "control.chat";
+    public const string CapabilityBulkFile = "bulk.file";
+    public const string CapabilityBulkSpeed = "bulk.speed";
+    public const string CapabilityDiagnosticsExport = "diagnostics.export";
+    public const string CapabilityAudioLink = "audio.link";
+    public const string CapabilityAudioCodecOpus = "audio.codec.opus";
+    public const string CapabilityAudioTransportRtp = "audio.transport.rtp";
+    public const string CapabilityAudioRtcp = "audio.rtcp";
+    public const string CapabilityAudioCodecLibOpus = "audio.codec.libopus";
+    public const string CapabilityAudioQualitySelect = "audio.quality.select";
+
+    public static readonly string[] AdvertisedCapabilities =
+    [
+        CapabilityChat,
+        CapabilityBulkFile,
+        CapabilityBulkSpeed,
+        CapabilityDiagnosticsExport,
+        CapabilityAudioLink,
+        CapabilityAudioCodecOpus,
+        CapabilityAudioTransportRtp,
+        CapabilityAudioRtcp,
+        CapabilityAudioCodecLibOpus,
+        CapabilityAudioQualitySelect
+    ];
+}

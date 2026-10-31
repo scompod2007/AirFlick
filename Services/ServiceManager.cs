@@ -1,0 +1,591 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Net.NetworkInformation;
+using System.Threading;
+using System.Threading.Tasks;
+using Windows.ApplicationModel.Resources;
+
+namespace AirFlick.Services
+{
+    /// <summary>
+    /// Singleton service manager that provides global access to WiFiDirectService,
+    /// SessionManager, and feature services.
+    /// </summary>
+    public static class ServiceManager
+    {
+        private const string DefaultWiFiDirectUnavailableMessage = "This WiFi adapter/driver does not support Windows WiFi Direct peer discovery required by AirFlick.";
+
+        private static DataManager? _dataManager;
+        private static WiFiDirectService? _wifiDirectService;
+        private static SessionManager? _sessionManager;
+        private static FileTransferService? _fileTransferService;
+        private static readonly object _lock = new object();
+        private static readonly SemaphoreSlim LifecycleSemaphore = new(1, 1);
+        private static bool _isInitialized = false;
+        private static bool _areWiFiDirectServicesAvailable = false;
+        private static string? _serviceInitializationError;
+        
+        /// <summary>
+        /// Gets the singleton DataManager instance.
+        /// </summary>
+        public static DataManager? DataManager
+        {
+            get
+            {
+                if (_dataManager == null)
+                {
+                    try
+                    {
+                        _dataManager = DataManager.Instance;
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"DataManager is not available: {ex.Message}");
+                    }
+                }
+
+                return _dataManager;
+            }
+        }
+        
+        /// <summary>
+        /// Gets the singleton WiFiDirectService instance.
+        /// </summary>
+        public static WiFiDirectService? WiFiDirectService
+        {
+            get
+            {
+                return _wifiDirectService;
+            }
+        }
+        
+        /// <summary>
+        /// Gets the singleton SessionManager instance.
+        /// </summary>
+        public static SessionManager? SessionManager
+        {
+            get
+            {
+                return _sessionManager;
+            }
+        }
+        
+        /// <summary>
+        /// Gets the FileTransferService instance.
+        /// </summary>
+        public static FileTransferService? FileTransferService
+        {
+            get
+            {
+                return _fileTransferService;
+            }
+        }
+        
+        /// <summary>
+        /// Gets whether the ServiceManager has been initialized.
+        /// </summary>
+        public static bool IsInitialized => _isInitialized;
+
+        /// <summary>
+        /// Gets whether WiFi Direct dependent services were initialized successfully.
+        /// </summary>
+        public static bool AreWiFiDirectServicesAvailable => _areWiFiDirectServicesAvailable;
+
+        /// <summary>
+        /// Gets the last WiFi Direct service initialization error, if any.
+        /// </summary>
+        public static string? ServiceInitializationError => _serviceInitializationError;
+
+        /// <summary>
+        /// Gets a user-facing message for pages that depend on WiFi Direct services.
+        /// </summary>
+        public static string ServiceUnavailableMessage => _serviceInitializationError ?? GetLocalizedString("WiFiDirectUnavailable_PeerDiscoveryMessage", DefaultWiFiDirectUnavailableMessage);
+        
+        /// <summary>
+        /// Initializes the ServiceManager with a singleton WiFiDirectService instance.
+        /// This should be called once during application startup.
+        /// </summary>
+        public static void Initialize()
+        {
+            lock (_lock)
+            {
+                if (_isInitialized)
+                {
+                    return; // Already initialized
+                }
+
+                _serviceInitializationError = null;
+                _areWiFiDirectServicesAvailable = false;
+
+                // Initialize DataManager independently so Settings and persisted app data still
+                // work when WiFi Direct services cannot be created.
+                try
+                {
+                    _dataManager = DataManager.Instance;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Failed to initialize DataManager: {ex.Message}");
+                    _serviceInitializationError = $"App settings storage could not be initialized: {ex.Message}";
+                }
+
+                _isInitialized = true;
+
+                try
+                {
+                    ValidateWiFiDirectSupport();
+
+                    _wifiDirectService = new WiFiDirectService();
+                    _sessionManager = SessionManager.Instance;
+                    _sessionManager.Initialize(_wifiDirectService);
+                    _sessionManager.PeerProtocolMissing += OnSessionPeerProtocolMissing;
+
+                    // Initialize feature services after WiFiDirectService and SessionManager.
+                    InitializeAdditionalServices();
+                    _areWiFiDirectServicesAvailable = true;
+                }
+                catch (System.Runtime.InteropServices.COMException comEx) when (comEx.HResult == unchecked((int)0x80070032) || comEx.HResult == unchecked((int)0x80004005))
+                {
+                    // WiFi Direct not supported (ERROR_NOT_SUPPORTED or E_FAIL)
+                    HandleWiFiDirectInitializationFailure("WiFi Direct is not supported on this system. Check that Windows, the wireless adapter, and WiFi Direct drivers support WiFi Direct.", comEx);
+                }
+                catch (UnauthorizedAccessException uaEx)
+                {
+                    // WiFi Direct access denied
+                    HandleWiFiDirectInitializationFailure("WiFi Direct access is denied. Please check that WiFi is enabled and the app has the required permissions.", uaEx);
+                }
+                catch (NotSupportedException nsEx)
+                {
+                    HandleWiFiDirectInitializationFailure(nsEx.Message, nsEx);
+                }
+                catch (Exception ex)
+                {
+                    // Check if the inner exception or message indicates WiFi Direct is not supported
+                    if (ex.Message.Contains("WiFi Direct") || ex.Message.Contains("not supported") || ex.Message.Contains("wireless"))
+                    {
+                        HandleWiFiDirectInitializationFailure("WiFi Direct is not supported on this system. Check that Windows, the wireless adapter, and WiFi Direct drivers support WiFi Direct.", ex);
+                    }
+                    else
+                    {
+                        HandleWiFiDirectInitializationFailure($"Failed to initialize WiFi Direct services: {ex.Message}", ex);
+                    }
+                }
+            }
+        }
+
+        private static void ValidateWiFiDirectSupport()
+        {
+            // Selector creation catches machines where the WinRT WiFi Direct API itself is
+            // unavailable. The netsh capability probe catches adapters whose driver exposes
+            // only partial WiFi Direct support, such as no P2P device discovery.
+            _ = Windows.Devices.WiFiDirect.WiFiDirectDevice.GetDeviceSelector(
+                Windows.Devices.WiFiDirect.WiFiDirectDeviceSelectorType.AssociationEndpoint);
+
+            if (!HasWirelessAdapter())
+            {
+                throw new NotSupportedException("WiFi Direct is not supported on this system because no WiFi adapter was found. Check that Windows, the wireless adapter, and WiFi Direct drivers support WiFi Direct.");
+            }
+
+            var capabilityReport = TryReadWirelessCapabilityReport();
+            if (capabilityReport == null)
+            {
+                return;
+            }
+
+            var missingCapabilities = capabilityReport.GetMissingRequiredCapabilities();
+            if (missingCapabilities.Count == 0)
+            {
+                return;
+            }
+
+            throw new NotSupportedException(BuildUnsupportedCapabilityMessage(capabilityReport, missingCapabilities));
+        }
+
+        private static bool HasWirelessAdapter()
+        {
+            return NetworkInterface.GetAllNetworkInterfaces()
+                .Any(adapter => adapter.NetworkInterfaceType == NetworkInterfaceType.Wireless80211);
+        }
+
+        private static WiFiDirectCapabilityReport? TryReadWirelessCapabilityReport()
+        {
+            try
+            {
+                var output = RunNetsh("wlan", "show", "wirelesscapabilities");
+                if (string.IsNullOrWhiteSpace(output))
+                {
+                    return null;
+                }
+
+                var report = WiFiDirectCapabilityReport.Parse(output);
+                var hasKnownCapabilityLabels = WiFiDirectCapabilityReport.RequiredCapabilities
+                    .Any(capability => report.GetCapabilityValue(capability) != null);
+
+                if (!hasKnownCapabilityLabels)
+                {
+                    Debug.WriteLine("WiFi Direct capability probe did not contain expected labels; skipping strict capability validation.");
+                    return null;
+                }
+
+                return report;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"WiFi Direct capability probe failed: {ex}");
+                return null;
+            }
+        }
+
+        private static string RunNetsh(params string[] arguments)
+        {
+            using var process = new Process();
+            process.StartInfo = new ProcessStartInfo
+            {
+                FileName = "netsh.exe",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            foreach (var argument in arguments)
+            {
+                process.StartInfo.ArgumentList.Add(argument);
+            }
+
+            if (!process.Start())
+            {
+                throw new InvalidOperationException("Could not start netsh.exe.");
+            }
+
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(5000))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                }
+
+                throw new TimeoutException("Timed out while reading wireless capabilities.");
+            }
+
+            var output = outputTask.GetAwaiter().GetResult();
+            var error = errorTask.GetAwaiter().GetResult();
+
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException($"netsh exited with code {process.ExitCode}: {error}");
+            }
+
+            return output;
+        }
+
+        private static string BuildUnsupportedCapabilityMessage(
+            WiFiDirectCapabilityReport report,
+            IReadOnlyList<string> missingCapabilities)
+        {
+            var interfaceName = string.IsNullOrWhiteSpace(report.InterfaceName)
+                ? string.Empty
+                : $" Interface: {report.InterfaceName}.";
+
+            Debug.WriteLine("WiFi Direct capability check failed." +
+                            interfaceName +
+                            $" Missing capability: {string.Join(", ", missingCapabilities)}." +
+                            $" Reported capabilities: {report.BuildRequiredCapabilitySummary()}.");
+
+            return GetLocalizedString("WiFiDirectUnavailable_PeerDiscoveryMessage", DefaultWiFiDirectUnavailableMessage);
+        }
+
+        private static string GetLocalizedString(string resourceKey, string fallback)
+        {
+            try
+            {
+                var value = ResourceLoader.GetForViewIndependentUse().GetString(resourceKey);
+                return string.IsNullOrWhiteSpace(value) ? fallback : value;
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        private static void HandleWiFiDirectInitializationFailure(string message, Exception exception)
+        {
+            _areWiFiDirectServicesAvailable = false;
+            _serviceInitializationError = message;
+            System.Diagnostics.Debug.WriteLine($"{message} {exception}");
+            DisposeWiFiDirectServices();
+        }
+
+        /// <summary>
+        /// Initializes ChatService, SpeedTestService, and FileTransferService.
+        /// Called after WiFiDirectService is initialized.
+        /// </summary>
+        private static void InitializeAdditionalServices()
+        {
+            // Reset any existing instances
+            FileTransferService.ResetInstance();
+
+            // Create new instances; feature services subscribe to SessionManager events.
+            _fileTransferService = FileTransferService.Instance;
+
+            // AirFlick backend command layer: wraps the services above; no networking of its own.
+            if (_wifiDirectService != null && _sessionManager != null)
+            {
+                AirFlickBackend.Initialize(_wifiDirectService, _sessionManager, _fileTransferService);
+            }
+        }
+
+        private static void DisposeFeatureServices()
+        {
+            TryDispose(AirFlickBackend.Reset, "AirFlickBackend");
+
+            TryDispose(FileTransferService.ResetInstance, "FileTransferService");
+            _fileTransferService = null;
+        }
+
+        private static async void OnSessionPeerProtocolMissing(object? sender, SessionFailedEventArgs e)
+        {
+            var wifiDirectService = _wifiDirectService;
+            if (wifiDirectService == null)
+            {
+                return;
+            }
+
+            try
+            {
+                Debug.WriteLine($"Peer protocol mismatch detected; disconnecting Wi-Fi Direct. reason={e.Reason}");
+                await wifiDirectService.DisconnectAsync("peer_protocol_missing").ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error disconnecting Wi-Fi Direct after peer protocol mismatch: {ex}");
+            }
+        }
+
+        private static void DisposeWiFiDirectServices()
+        {
+            DisposeFeatureServices();
+
+            if (_sessionManager != null)
+            {
+                _sessionManager.PeerProtocolMissing -= OnSessionPeerProtocolMissing;
+            }
+            TryDispose(SessionManager.ResetInstance, "SessionManager");
+            _sessionManager = null;
+
+            if (_wifiDirectService != null)
+            {
+                try
+                {
+                    _wifiDirectService.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error disposing WiFiDirectService: {ex}");
+                }
+                finally
+                {
+                    _wifiDirectService = null;
+                }
+            }
+        }
+
+        public static async Task<WiFiDirectCleanupResult> ResetWiFiDirectAsync(
+            CancellationToken cancellationToken = default)
+        {
+            await LifecycleSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var coordinator = new WiFiDirectCleanupCoordinator(
+                    new ServiceManagerCleanupLifecycle(),
+                    new WindowsWiFiDirectPeerStore(),
+                    message => Debug.WriteLine(message));
+                return await coordinator
+                    .CleanupAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                LifecycleSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Stops active work and releases all application services before process exit.
+        /// </summary>
+        public static async Task ShutdownAsync(
+            string reason = "app_shutdown",
+            CancellationToken cancellationToken = default)
+        {
+            await LifecycleSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (!_isInitialized &&
+                    _wifiDirectService == null &&
+                    _sessionManager == null &&
+                    _dataManager == null)
+                {
+                    return;
+                }
+
+                await StopFeatureActivityCoreAsync(cancellationToken).ConfigureAwait(false);
+                await DisconnectCoreAsync(reason, cancellationToken).ConfigureAwait(false);
+                await StopWiFiDirectCoreAsync(reason, cancellationToken).ConfigureAwait(false);
+                await DisposeServicesCoreAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                LifecycleSemaphore.Release();
+            }
+        }
+
+        private static async Task StopFeatureActivityCoreAsync(CancellationToken cancellationToken)
+        {
+            DisposeFeatureServices();
+            await Task.CompletedTask;
+        }
+
+        private static async Task DisconnectCoreAsync(
+            string reason,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (_sessionManager != null)
+            {
+                try
+                {
+                    await _sessionManager.DisconnectAsync(reason).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error disconnecting WDCable session: {ex}");
+                }
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (_wifiDirectService != null)
+            {
+                try
+                {
+                    await _wifiDirectService.DisconnectAsync(reason).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error disconnecting Wi-Fi Direct: {ex}");
+                }
+            }
+        }
+
+        private static async Task StopWiFiDirectCoreAsync(
+            string reason,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (_wifiDirectService == null)
+            {
+                return;
+            }
+
+            try
+            {
+                await _wifiDirectService.StopInfrastructureAsync(reason).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error stopping Wi-Fi Direct infrastructure: {ex}");
+            }
+        }
+
+        private static Task DisposeServicesCoreAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            DisposeWiFiDirectServices();
+
+            TryDispose(DataManager.ResetInstance, "DataManager");
+            _dataManager = null;
+
+            _serviceInitializationError = null;
+            _areWiFiDirectServicesAvailable = false;
+            _isInitialized = false;
+            return Task.CompletedTask;
+        }
+
+        private static void TryDispose(Action dispose, string serviceName)
+        {
+            try
+            {
+                dispose();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error disposing {serviceName}: {ex}");
+            }
+        }
+
+        private sealed class ServiceManagerCleanupLifecycle : IWiFiDirectCleanupLifecycle
+        {
+            public Task StopFeatureActivityAsync(CancellationToken cancellationToken)
+            {
+                return StopFeatureActivityCoreAsync(cancellationToken);
+            }
+
+            public Task DisconnectAsync(CancellationToken cancellationToken)
+            {
+                return DisconnectCoreAsync("wifi_direct_reset", cancellationToken);
+            }
+
+            public Task StopWiFiDirectAsync(CancellationToken cancellationToken)
+            {
+                return StopWiFiDirectCoreAsync("wifi_direct_reset", cancellationToken);
+            }
+
+            public Task DisposeServicesAsync(CancellationToken cancellationToken)
+            {
+                return DisposeServicesCoreAsync(cancellationToken);
+            }
+        }
+        
+        /// <summary>
+        /// Gets whether a WiFi Direct connection is currently established.
+        /// </summary>
+        public static bool IsConnected => _wifiDirectService?.IsConnected ?? false;
+        
+        /// <summary>
+        /// Gets whether the device is currently advertising (discoverable).
+        /// </summary>
+        public static bool IsAdvertising => _wifiDirectService?.IsAdvertising ?? false;
+        
+        /// <summary>
+        /// Gets whether the device is currently scanning for other devices.
+        /// </summary>
+        public static bool IsScanning => _wifiDirectService?.IsScanning ?? false;
+
+        /// <summary>
+        /// Asynchronously initializes ServiceManager.
+        /// </summary>
+        public static Task InitializeAsync()
+        {
+            Initialize();
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Asynchronously shuts down all services.
+        /// </summary>
+        public static Task ShutdownAsync()
+        {
+            return ShutdownAsync("app_shutdown", CancellationToken.None);
+        }
+    }
+}

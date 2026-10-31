@@ -1,0 +1,486 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using Windows.Storage;
+using Microsoft.UI.Dispatching;
+
+namespace AirFlick.Services
+{
+    /// <summary>
+    /// Singleton data manager service that handles all application data persistence.
+    /// This service manages app settings, user preferences, and configuration data.
+    /// </summary>
+    public class DataManager
+    {
+        private static DataManager? _instance;
+        private static readonly object _lock = new object();
+        
+        private readonly ApplicationDataContainer _localSettings;
+        private readonly DispatcherQueue _dispatcherQueue;
+        private readonly object _historyLock = new();
+        private readonly string _localDataPath;
+        private bool _isDisposed = false;
+
+        private const string FileTransferHistoryFileName = "file-transfer-history.json";
+        private static readonly JsonSerializerOptions HistoryJsonOptions = new()
+        {
+            WriteIndented = true
+        };
+        
+        // Events
+        public event EventHandler<string>? SettingChanged;
+        public event EventHandler<string>? ErrorOccurred;
+        
+        /// <summary>
+        /// Gets the singleton DataManager instance.
+        /// </summary>
+        public static DataManager Instance
+        {
+            get
+            {
+                if (_instance == null)
+                {
+                    lock (_lock)
+                    {
+                        if (_instance == null)
+                        {
+                            _instance = new DataManager();
+                        }
+                    }
+                }
+                return _instance;
+            }
+        }
+        
+        /// <summary>
+        /// Private constructor to enforce singleton pattern.
+        /// </summary>
+        private DataManager()
+        {
+            _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+            _localSettings = ApplicationData.Current.LocalSettings;
+            _localDataPath = ApplicationData.Current.LocalFolder.Path;
+            
+            // Initialize default settings if they don't exist
+            InitializeDefaultSettings();
+        }
+        
+        /// <summary>
+        /// Initializes default application settings.
+        /// </summary>
+        private void InitializeDefaultSettings()
+        {
+            try
+            {
+                // Set default language if not exists
+                if (!_localSettings.Values.ContainsKey("AppLanguage"))
+                {
+                    _localSettings.Values["AppLanguage"] = "system";
+                }
+                
+                // Set default theme if not exists
+                if (!_localSettings.Values.ContainsKey("AppTheme"))
+                {
+                    _localSettings.Values["AppTheme"] = "default";
+                }
+                
+                // Set default download path if not exists
+                if (!_localSettings.Values.ContainsKey("DownloadPath"))
+                {
+                    var defaultDownloadPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                    _localSettings.Values["DownloadPath"] = defaultDownloadPath;
+                }
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to initialize default settings: {ex.Message}");
+            }
+        }
+        
+        #region Settings Management
+        
+        /// <summary>
+        /// Gets the application language setting.
+        /// </summary>
+        /// <returns>The language tag (e.g., "en", "zh-CN", "system")</returns>
+        public string GetAppLanguage()
+        {
+            try
+            {
+                return _localSettings.Values["AppLanguage"] as string ?? "system";
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to get app language: {ex.Message}");
+                return "system";
+            }
+        }
+        
+        /// <summary>
+        /// Sets the application language setting.
+        /// </summary>
+        /// <param name="languageTag">The language tag to set</param>
+        public void SetAppLanguage(string languageTag)
+        {
+            try
+            {
+                _localSettings.Values["AppLanguage"] = languageTag;
+                OnSettingChanged("AppLanguage");
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to set app language: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Gets the application theme setting.
+        /// </summary>
+        /// <returns>The theme tag ("default", "light", "dark")</returns>
+        public string GetAppTheme()
+        {
+            try
+            {
+                return _localSettings.Values["AppTheme"] as string ?? "default";
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to get app theme: {ex.Message}");
+                return "default";
+            }
+        }
+        
+        /// <summary>
+        /// Sets the application theme setting.
+        /// </summary>
+        /// <param name="themeTag">The theme tag to set</param>
+        public void SetAppTheme(string themeTag)
+        {
+            try
+            {
+                _localSettings.Values["AppTheme"] = themeTag;
+                OnSettingChanged("AppTheme");
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to set app theme: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Gets the download path setting.
+        /// </summary>
+        /// <returns>The download path</returns>
+        public string GetDownloadPath()
+        {
+            try
+            {
+                var path = _localSettings.Values["DownloadPath"] as string;
+                if (string.IsNullOrEmpty(path))
+                {
+                    path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                    SetDownloadPath(path);
+                }
+                return path;
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to get download path: {ex.Message}");
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+            }
+        }
+        
+        /// <summary>
+        /// Sets the download path setting.
+        /// </summary>
+        /// <param name="path">The download path to set</param>
+        public void SetDownloadPath(string path)
+        {
+            try
+            {
+                _localSettings.Values["DownloadPath"] = path;
+                OnSettingChanged("DownloadPath");
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to set download path: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Gets a generic setting value.
+        /// </summary>
+        /// <param name="key">The setting key</param>
+        /// <param name="defaultValue">The default value if the setting doesn't exist</param>
+        /// <returns>The setting value or default value</returns>
+        public T GetSetting<T>(string key, T defaultValue)
+        {
+            try
+            {
+                var value = _localSettings.Values[key];
+                if (value != null && value is T typedValue)
+                {
+                    return typedValue;
+                }
+                return defaultValue;
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to get setting '{key}': {ex.Message}");
+                return defaultValue;
+            }
+        }
+        
+        /// <summary>
+        /// Sets a generic setting value.
+        /// </summary>
+        /// <param name="key">The setting key</param>
+        /// <param name="value">The setting value</param>
+        public void SetSetting<T>(string key, T value)
+        {
+            try
+            {
+                _localSettings.Values[key] = value;
+                OnSettingChanged(key);
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to set setting '{key}': {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Removes a setting.
+        /// </summary>
+        /// <param name="key">The setting key to remove</param>
+        public void RemoveSetting(string key)
+        {
+            try
+            {
+                if (_localSettings.Values.ContainsKey(key))
+                {
+                    _localSettings.Values.Remove(key);
+                    OnSettingChanged(key);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to remove setting '{key}': {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Checks if a setting exists.
+        /// </summary>
+        /// <param name="key">The setting key</param>
+        /// <returns>True if the setting exists, false otherwise</returns>
+        public bool HasSetting(string key)
+        {
+            try
+            {
+                return _localSettings.Values.ContainsKey(key);
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to check setting '{key}': {ex.Message}");
+                return false;
+            }
+        }
+        
+        #endregion
+        
+        #region Event Handlers
+        
+        /// <summary>
+        /// Raises the SettingChanged event.
+        /// </summary>
+        /// <param name="settingKey">The key of the setting that changed</param>
+        private void OnSettingChanged(string settingKey)
+        {
+            try
+            {
+                _dispatcherQueue?.TryEnqueue(() => SettingChanged?.Invoke(this, settingKey));
+            }
+            catch
+            {
+                // Ignore dispatcher errors during event delivery
+            }
+        }
+        
+        /// <summary>
+        /// Raises the ErrorOccurred event.
+        /// </summary>
+        /// <param name="error">The error message</param>
+        private void OnErrorOccurred(string error)
+        {
+            try
+            {
+                _dispatcherQueue?.TryEnqueue(() => ErrorOccurred?.Invoke(this, error));
+            }
+            catch
+            {
+                // Ignore dispatcher errors during error reporting
+            }
+        }
+        
+        #endregion
+
+        #region File Transfer History Management
+
+        public List<FileTransferRecordData> LoadFileTransferHistory()
+        {
+            try
+            {
+                lock (_historyLock)
+                {
+                    return ReadHistoryFile<FileTransferRecordData>(FileTransferHistoryFileName);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to load file transfer history: {ex.Message}");
+                return [];
+            }
+        }
+
+        public void UpsertFileTransferRecord(FileTransferRecordData record)
+        {
+            try
+            {
+                lock (_historyLock)
+                {
+                    var existing = ReadHistoryFile<FileTransferRecordData>(FileTransferHistoryFileName);
+                    var records = HistoryDataOperations.UpsertTransferRecord(existing, record);
+                    WriteHistoryFile(FileTransferHistoryFileName, records);
+                }
+                OnSettingChanged("FileTransferHistory");
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to save file transfer history: {ex.Message}");
+            }
+        }
+
+        public void ClearFileTransferHistory()
+        {
+            try
+            {
+                lock (_historyLock)
+                {
+                    DeleteHistoryFile(FileTransferHistoryFileName);
+                }
+                OnSettingChanged("FileTransferHistory");
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccurred($"Failed to clear file transfer history: {ex.Message}");
+            }
+        }
+
+        #endregion
+        
+        #region Singleton Management
+        
+        /// <summary>
+        /// Resets the singleton instance. Used for testing and cleanup.
+        /// </summary>
+        public static void ResetInstance()
+        {
+            lock (_lock)
+            {
+                _instance?.Dispose();
+                _instance = null;
+            }
+        }
+        
+        /// <summary>
+        /// Disposes the DataManager and cleans up resources.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+            
+            try
+            {
+                // Clear events
+                SettingChanged = null;
+                ErrorOccurred = null;
+                
+                _isDisposed = true;
+            }
+            catch
+            {
+                // Ignore errors during disposal
+            }
+        }
+        
+        #endregion
+
+        private List<T> ReadHistoryFile<T>(string fileName)
+        {
+            var path = HistoryPath(fileName);
+            if (!File.Exists(path))
+            {
+                return [];
+            }
+
+            using var stream = File.OpenRead(path);
+            return JsonSerializer.Deserialize<List<T>>(stream, HistoryJsonOptions) ?? [];
+        }
+
+        private void WriteHistoryFile<T>(string fileName, IReadOnlyCollection<T> values)
+        {
+            Directory.CreateDirectory(_localDataPath);
+            var path = HistoryPath(fileName);
+            var temporaryPath = $"{path}.{Guid.NewGuid():N}.tmp";
+
+            try
+            {
+                using (var stream = new FileStream(
+                           temporaryPath,
+                           FileMode.CreateNew,
+                           FileAccess.Write,
+                           FileShare.None))
+                {
+                    JsonSerializer.Serialize(stream, values, HistoryJsonOptions);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                if (File.Exists(path))
+                {
+                    File.Replace(temporaryPath, path, destinationBackupFileName: null);
+                }
+                else
+                {
+                    File.Move(temporaryPath, path);
+                }
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath))
+                {
+                    File.Delete(temporaryPath);
+                }
+            }
+        }
+
+        private void DeleteHistoryFile(string fileName)
+        {
+            var path = HistoryPath(fileName);
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+
+        private string HistoryPath(string fileName)
+        {
+            return Path.Combine(_localDataPath, fileName);
+        }
+    }
+}

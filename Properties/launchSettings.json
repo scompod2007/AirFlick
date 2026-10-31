@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "AirFlick (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "AirFlick (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
