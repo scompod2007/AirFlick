@@ -88,7 +88,11 @@ verify_and_prepare_git.ps1
 
 docs/airflick-rebuild/backups/
 
-Gesture/
+# Ignore Gesture source, but allow model assets
+Gesture/*
+!Gesture/models/
+Gesture/models/*
+!Gesture/models/**
 
 # Gesture feature files maintained separately
 AirFlick.Tests/GestureBridgeServiceTests.cs
